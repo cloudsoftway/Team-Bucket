@@ -3,7 +3,12 @@
 import React, { useEffect, useState } from 'react';
 import { ProjectTask, Project, TeamMember } from '@/lib/odoo';
 import { createActionSession, createAction, updateActionSession, deleteAction, findActionsByEntityAndType } from '@/lib/actions';
+import { buildTaskAssignPayload, buildAddMemberToTeamPayload } from '@/lib/actionEngine';
 import ActionsPanel from './ActionsPanel';
+import { useAppDispatch, useAppSelector } from '@/store/hooks';
+import { setTeamMembers as setTeamMembersRedux, TeamMemberWithCapacity } from '@/store/teamMembersSlice';
+import { setSelectedProjects } from '@/store/selectedProjectsSlice';
+import { addProjectTeamMemberId, removeProjectTeamMemberId, setProjectTeamMemberIds } from '@/store/projectTeamMemberIdsSlice';
 
 // Helper function to build full Odoo URL
 const getOdooTaskUrl = (accessUrl: string): string => {
@@ -25,11 +30,17 @@ const getOdooTaskUrl = (accessUrl: string): string => {
 };
 
 export default function Dashboard() {
+  const dispatch = useAppDispatch();
+  
+  // Redux selectors
+  const teamMembersRedux = useAppSelector((state) => state.teamMembers.members);
+  const selectedProjectIds = useAppSelector((state) => state.selectedProjects.projectIds);
+  const projectTeamMemberIds = useAppSelector((state) => state.projectTeamMemberIds.memberIds);
+  
   const [unassignedTasks, setUnassignedTasks] = useState<ProjectTask[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [displayedMembers, setDisplayedMembers] = useState<TeamMember[]>([]);
-  const [selectedProjectIds, setSelectedProjectIds] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [membersLoading, setMembersLoading] = useState(false);
@@ -41,16 +52,6 @@ export default function Dashboard() {
   const [taskAssignments, setTaskAssignments] = useState<Map<number, number>>(new Map()); // taskId -> userId
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [isUnassignedSectionExpanded, setIsUnassignedSectionExpanded] = useState(true);
-
-  // Persist selected project filters so other components (e.g. Sidebar) can react
-  useEffect(() => {
-    try {
-      localStorage.setItem('selectedProjectIds', JSON.stringify(selectedProjectIds));
-      window.dispatchEvent(new Event('projectFilterChanged'));
-    } catch (err) {
-      console.error('Failed to persist selectedProjectIds:', err);
-    }
-  }, [selectedProjectIds]);
 
   // Calculate member capacity based on weekly hours minus weekly vacation hours
   const getMemberCapacity = (member: TeamMember): { hours: number; percentage: number } => {
@@ -146,17 +147,9 @@ export default function Dashboard() {
     if (!memberId) return;
 
     try {
-      let member: TeamMember | undefined = teamMembers.find((m) => m.id === memberId);
-
-      if (!member) {
-        const cached = localStorage.getItem('teamMembersCached');
-        if (cached) {
-          const cachedMembers: TeamMember[] = JSON.parse(cached);
-          member = cachedMembers.find((m) => m.id === memberId);
-        }
-      }
-
+      const member = teamMembersRedux.find((m) => m.id === memberId);
       if (!member) return;
+      console.log('member:', member);
 
       setDisplayedMembers((prev) => {
         // If already displayed, no need to add again
@@ -166,23 +159,29 @@ export default function Dashboard() {
         return [...prev, member as TeamMember];
       });
 
-      // Mark this member as part of the Project Team (hidden from sidebar)
-      try {
-        const raw = localStorage.getItem('projectTeamMemberIds');
-        let ids: number[] = [];
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            ids = parsed.filter((id) => typeof id === 'number');
-          }
-        }
-        if (!ids.includes(memberId)) {
-          ids.push(memberId);
-          localStorage.setItem('projectTeamMemberIds', JSON.stringify(ids));
-          window.dispatchEvent(new Event('sidebarMembersChanged'));
-        }
-      } catch (e) {
-        console.error('Failed to update projectTeamMemberIds in localStorage:', e);
+      // Mark this member as part of the Project Team (hidden from sidebar) in Redux
+      if (!projectTeamMemberIds.includes(memberId)) {
+        dispatch(addProjectTeamMemberId(memberId));
+      }
+
+      if (currentSessionId) {
+        const { update_json, condition_json, additional_info_json } = buildAddMemberToTeamPayload(
+          member as TeamMember,
+          selectedProjectIds
+        );
+        createAction(
+          currentSessionId,
+          `Add member "${member.name}" (ID: ${member.id}) to Project Team`,
+          'project.project',
+          member.id,
+          'add_to_team',
+          { in_team: false },
+          { in_team: true },
+          update_json,
+          condition_json || null,
+          additional_info_json || null
+        );
+        window.dispatchEvent(new Event('actionsUpdated'));
       }
 
       // After the card is rendered, scroll it into view and highlight
@@ -230,7 +229,8 @@ export default function Dashboard() {
         task_name: draggedTask.name,
       };
       
-      // Create action using the current session
+      // Build engine payload (update/condition) and create action using the current session
+      const { update_json, condition_json, additional_info_json } = buildTaskAssignPayload(draggedTask, member!);
       createAction(
         currentSessionId,
         `Assign task "${draggedTask.name}" (ID: ${draggedTask.id}) to ${memberName}`,
@@ -238,7 +238,10 @@ export default function Dashboard() {
         draggedTask.id,
         'assign',
         beforeState,
-        afterState
+        afterState,
+        update_json,
+        condition_json || null,
+        additional_info_json || null
       );
       
       // Dispatch event to notify ActionsPanel
@@ -338,7 +341,6 @@ export default function Dashboard() {
       let membersToProcess: TeamMember[] = [];
       
       if (selectedProjectIds.length > 0) {
-        // Fetch project-specific members
         try {
           setMembersLoading(true);
           const memberPromises = selectedProjectIds.map(projectId =>
@@ -569,37 +571,26 @@ export default function Dashboard() {
     setCurrentSessionId(session.id);
     
     const initialize = async () => {
-      // await fetchProjects();
-      // Fetch all team members first
+     
       try {
-        // const response = await fetch('/api/team-members');
-        // const data = await response.json();
-        // if (response.ok) {
-        //   //setTeamMembers(data.teamMembers || []);
-        // }
+      // nothgin to do here
       } catch (err) {
         console.error('Error fetching team members:', err);
       }
-      // Then fetch all data
       await fetchAllData();
     };
     initialize();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Fetch all data when project filter or dates change
   useEffect(() => {
     const startDate = localStorage.getItem('vacationStartDate');
     const endDate = localStorage.getItem('vacationEndDate');
     
-    // Only fetch if we have team members loaded and dates are set (or not required for tasks)
     if (teamMembers.length > 0) {
       fetchAllData();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectIds]);
 
-  // Set up event listener for vacation date changes (from navbar)
   useEffect(() => {
     const handleDatesChanged = () => {
       if (teamMembers.length > 0) {
@@ -609,7 +600,6 @@ export default function Dashboard() {
 
     window.addEventListener('vacationDatesChanged', handleDatesChanged);
     
-    // Also listen for storage changes (when dates are updated in other tabs)
     const handleStorageChange = (e: StorageEvent) => {
       if (e.key === 'vacationStartDate' || e.key === 'vacationEndDate') {
         handleDatesChanged();
@@ -621,11 +611,8 @@ export default function Dashboard() {
       window.removeEventListener('vacationDatesChanged', handleDatesChanged);
       window.removeEventListener('storage', handleStorageChange);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [teamMembers.length]); // Re-setup when team members are loaded
 
-  // Broadcast all team members with their assigned capacity so Sidebar can reuse the exact same values,
-  // including for members returned by the non-members API when project filters are applied.
   useEffect(() => {
     if (teamMembers.length > 0) {
       try {
@@ -636,7 +623,6 @@ export default function Dashboard() {
           );
           return {
             ...member,
-            // Store what Sidebar needs to display the same design
             assignedCapacityPercentage: assignedCapacity.percentage,
             assignedCapacityHours: assignedCapacity.hours,
             assignedCapacityUsedPercentage: assignedCapacity.usedPercentage,
@@ -644,8 +630,8 @@ export default function Dashboard() {
           };
         });
 
-        localStorage.setItem('teamMembersCached', JSON.stringify(membersWithCapacity));
-        window.dispatchEvent(new Event('teamMembersUpdated'));
+        // Store team members with capacity in Redux
+        dispatch(setTeamMembersRedux(membersWithCapacity));
       } catch (err) {
         console.error('Failed to cache team members:', err);
       }
@@ -689,10 +675,7 @@ export default function Dashboard() {
     current.setHours(0, 0, 0, 0);
     const endDate = new Date(end);
     endDate.setHours(23, 59, 59, 999);
-    
-    // If workingDaysPerWeek is 5, exclude weekends (Saturday=6, Sunday=0)
-    // If workingDaysPerWeek is 6, exclude only Sunday
-    // If workingDaysPerWeek is 7, include all days
+   
     
     while (current <= endDate) {
       const dayOfWeek = current.getDay();
@@ -1057,7 +1040,7 @@ export default function Dashboard() {
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
-                      setSelectedProjectIds(pendingProjectIds);
+                      dispatch(setSelectedProjects(pendingProjectIds));
                       setIsProjectDropdownOpen(false);
                       // fetchAllData will be triggered by the effect on selectedProjectIds
                     }}
@@ -1083,7 +1066,7 @@ export default function Dashboard() {
                     {project.name}
                     <button
                       onClick={() => {
-                        setSelectedProjectIds(selectedProjectIds.filter((id) => id !== projectId));
+                        dispatch(setSelectedProjects(selectedProjectIds.filter((id) => id !== projectId)));
                       }}
                       className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
                       title="Remove"
@@ -1506,34 +1489,31 @@ export default function Dashboard() {
                   {member.active !== false && (
                     <div className="ml-2 flex-shrink-0 flex flex-col items-end gap-1">
                       <span className="w-3 h-3 bg-gradient-to-r from-green-400 to-emerald-500 rounded-full inline-block shadow-lg shadow-green-500/50 animate-pulse"></span>
-                      {/* Return to sidebar button */}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          // Remove from displayed members
-                          setDisplayedMembers((prev) => prev.filter((m) => m.id !== member.id));
-                          // Remove from projectTeamMemberIds so it reappears in sidebar
-                          try {
-                            const raw = localStorage.getItem('projectTeamMemberIds');
-                            let ids: number[] = [];
-                            if (raw) {
-                              const parsed = JSON.parse(raw);
-                              if (Array.isArray(parsed)) {
-                                ids = parsed.filter((id) => typeof id === 'number');
-                              }
+                      {/* Return to sidebar button – only for members that were dragged from the sidebar */}
+                      {projectTeamMemberIds.includes(member.id) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // Remove from displayed members
+                            setDisplayedMembers((prev) => prev.filter((m) => m.id !== member.id));
+                            // Remove from projectTeamMemberIds so it reappears in sidebar
+                            dispatch(removeProjectTeamMemberId(member.id));
+
+                            // Remove any "add_to_team" action recorded for this member in current session
+                            if (currentSessionId) {
+                              const teamActions = findActionsByEntityAndType(member.id, 'add_to_team');
+                              teamActions.forEach((action) => {
+                                deleteAction(action.id);
+                              });
+                              window.dispatchEvent(new Event('actionsUpdated'));
                             }
-                            const nextIds = ids.filter((id) => id !== member.id);
-                            localStorage.setItem('projectTeamMemberIds', JSON.stringify(nextIds));
-                            window.dispatchEvent(new Event('sidebarMembersChanged'));
-                          } catch (e) {
-                            console.error('Failed to update projectTeamMemberIds when returning member:', e);
-                          }
-                        }}
-                        className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors"
-                        title="Return member to sidebar"
-                      >
-                        Return
-                      </button>
+                          }}
+                          className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-zinc-100 text-zinc-600 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700 transition-colors"
+                          title="Return member to sidebar"
+                        >
+                          Return
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>

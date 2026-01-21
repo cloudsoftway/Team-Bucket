@@ -1,4 +1,3 @@
-// Action Session - groups related actions together
 export interface ActionSession {
   id: string;
   created_by: string; // User identifier (could be email, username, etc.)
@@ -6,16 +5,20 @@ export interface ActionSession {
   created_at: string; // ISO timestamp
 }
 
-// Individual Action - represents a single operation
 export interface Action {
   id: string;
   session_id: string;
-  description: string; // e.g., "assign task 14 to katia"
-  entity_type: string; // e.g., "project.task"
-  entity_id: number; // Odoo task ID
-  action_type: 'assign' | 'unassign' | 'change_stage';
-  before_state: Record<string, any>; // JSON object
-  after_state: Record<string, any>; // JSON object
-  applied_at: string | null; // ISO timestamp or null
+  description: string;
+  entity_type: string;
+  entity_id: number;
+  action_type: 'assign' | 'unassign' | 'change_stage' | 'add_to_team';
+  // Legacy before/after snapshots
+  before_state: Record<string, any>; 
+  after_state: Record<string, any>; 
+  // Engine-based payloads
+  update_json: Record<string, any>;
+  condition_json: Record<string, any> | null;
+  additional_info_json?: Record<string, any> | null;
+  applied_at: string | null; 
   status: 'pending' | 'applied' | 'failed';
 }

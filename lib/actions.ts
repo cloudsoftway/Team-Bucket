@@ -1,7 +1,8 @@
 import { ActionSession, Action } from '@/types/actions';
+import { store } from '@/store/store';
+import { addAction as addActionToStore, updateAction as updateActionInStore, deleteAction as deleteActionFromStore, setActions as setActionsInStore } from '@/store/actionsSlice';
 
 const SESSIONS_STORAGE_KEY = 'action_sessions';
-const ACTIONS_STORAGE_KEY = 'action_items';
 
 // Generate unique ID
 const generateId = (): string => {
@@ -17,7 +18,6 @@ const getCurrentUser = (): string => {
   return 'system';
 };
 
-// Action Session Management
 export const createActionSession = (): ActionSession => {
   const session: ActionSession = {
     id: generateId(),
@@ -53,8 +53,12 @@ export const deleteActionSession = (sessionId: string): void => {
   localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
   
   // Also delete all actions in this session
-  const actions = getActions().filter(a => a.session_id !== sessionId);
-  localStorage.setItem(ACTIONS_STORAGE_KEY, JSON.stringify(actions));
+  const remainingActions = getActions().filter(a => a.session_id !== sessionId);
+  try {
+    store.dispatch(setActionsInStore(remainingActions));
+  } catch (e) {
+    console.error('Failed to update actions in Redux when deleting session:', e);
+  }
 };
 
 // Action Management
@@ -63,9 +67,12 @@ export const createAction = (
   description: string,
   entityType: string,
   entityId: number,
-  actionType: 'assign' | 'unassign' | 'change_stage',
+  actionType: 'assign' | 'unassign' | 'change_stage' | 'add_to_team',
   beforeState: Record<string, any>,
-  afterState: Record<string, any>
+  afterState: Record<string, any>,
+  updateJson: Record<string, any> = {},
+  conditionJson: Record<string, any> | null = null,
+  additionalInfoJson: Record<string, any> | null = null
 ): Action => {
   const action: Action = {
     id: generateId(),
@@ -76,47 +83,58 @@ export const createAction = (
     action_type: actionType,
     before_state: beforeState,
     after_state: afterState,
+    update_json: updateJson,
+    condition_json: conditionJson,
+    additional_info_json: additionalInfoJson || null,
     applied_at: null,
     status: 'pending',
   };
   
-  const actions = getActions();
-  actions.push(action);
-  localStorage.setItem(ACTIONS_STORAGE_KEY, JSON.stringify(actions));
+  try {
+    store.dispatch(addActionToStore(action));
+  } catch (e) {
+    console.error('Failed to add action to Redux store:', e);
+  }
   
   return action;
 };
 
 export const getActions = (sessionId?: string): Action[] => {
-  if (typeof window === 'undefined') return [];
-  const stored = localStorage.getItem(ACTIONS_STORAGE_KEY);
-  const allActions: Action[] = stored ? JSON.parse(stored) : [];
-  
-  if (sessionId) {
-    return allActions.filter(a => a.session_id === sessionId);
+  try {
+    const state: any = store.getState();
+    const allActions: Action[] = state.actions?.actions || [];
+    
+    if (sessionId) {
+      return allActions.filter(a => a.session_id === sessionId);
+    }
+    
+    return allActions;
+  } catch (e) {
+    console.error('Failed to read actions from Redux store:', e);
+    return [];
   }
-  
-  return allActions;
 };
 
 export const updateAction = (actionId: string, updates: Partial<Action>): void => {
-  const actions = getActions();
-  const index = actions.findIndex(a => a.id === actionId);
-  if (index !== -1) {
-    actions[index] = { ...actions[index], ...updates };
-    localStorage.setItem(ACTIONS_STORAGE_KEY, JSON.stringify(actions));
+  try {
+    store.dispatch(updateActionInStore({ id: actionId, updates }));
+  } catch (e) {
+    console.error('Failed to update action in Redux store:', e);
   }
 };
 
 export const deleteAction = (actionId: string): void => {
-  const actions = getActions().filter(a => a.id !== actionId);
-  localStorage.setItem(ACTIONS_STORAGE_KEY, JSON.stringify(actions));
+  try {
+    store.dispatch(deleteActionFromStore(actionId));
+  } catch (e) {
+    console.error('Failed to delete action from Redux store:', e);
+  }
 };
 
 // Find actions by entity_id and action_type
 export const findActionsByEntityAndType = (
   entityId: number,
-  actionType: 'assign' | 'unassign' | 'change_stage'
+  actionType: 'assign' | 'unassign' | 'change_stage' | 'add_to_team'
 ): Action[] => {
   return getActions().filter(
     a => a.entity_id === entityId && a.action_type === actionType
@@ -134,9 +152,8 @@ export const getActionsWithSessions = (): Array<Action & { session: ActionSessio
       ...action,
       session: sessionMap.get(action.session_id)!,
     }))
-    .filter(item => item.session) // Filter out actions with missing sessions
+    .filter(item => item.session) 
     .sort((a, b) => {
-      // Sort by created_at descending (newest first)
       return new Date(b.session.created_at).getTime() - new Date(a.session.created_at).getTime();
     });
 };

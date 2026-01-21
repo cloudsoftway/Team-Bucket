@@ -1,12 +1,20 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { TeamMember } from '@/lib/odoo';
+import { useAppSelector } from '@/store/hooks';
+import { TeamMemberWithCapacity } from '@/store/teamMembersSlice';
 
 export default function Sidebar() {
-  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [teamMembers, setTeamMembers] = useState<TeamMemberWithCapacity[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isCollapsed, setIsCollapsed] = useState(false);
+
+  // Read from Redux store
+  const teamMembersRedux = useAppSelector((state) => state.teamMembers.members);
+  const selectedProjectIds = useAppSelector((state) => state.selectedProjects.projectIds);
+  const projectTeamMemberIds = useAppSelector((state) => state.projectTeamMemberIds.memberIds);
 
   useEffect(() => {
     const loadMembers = async () => {
@@ -14,76 +22,79 @@ export default function Sidebar() {
         setError(null);
         setLoading(true);
 
-        // Base cached members from Dashboard (with capacities/vacations)
-        const cached = localStorage.getItem('teamMembersCached');
-        const baseMembers: any[] = cached ? JSON.parse(cached) : [];
+        const baseMembers = teamMembersRedux;
 
-        // Members currently placed into the Project Team grid (hidden from sidebar)
-        let hiddenIds: number[] = [];
-        const rawHidden = localStorage.getItem('projectTeamMemberIds');
-        if (rawHidden) {
-          try {
-            const parsedHidden = JSON.parse(rawHidden);
-            if (Array.isArray(parsedHidden)) {
-              hiddenIds = parsedHidden.filter((id) => typeof id === 'number');
-            }
-          } catch (e) {
-            console.error('Failed to parse projectTeamMemberIds from localStorage:', e);
+        // If no base data yet, just show empty list
+        if (!baseMembers || baseMembers.length === 0) {
+          setTeamMembers([]);
+          return;
+        }
+
+        // If no project filters, show all members from Redux (with capacity) minus those already in the project grid
+        if (!selectedProjectIds || selectedProjectIds.length === 0) {
+          let membersToShow = baseMembers;
+          if (projectTeamMemberIds && projectTeamMemberIds.length > 0) {
+            membersToShow = membersToShow.filter(
+              (m) => typeof m?.id === 'number' && !projectTeamMemberIds.includes(m.id)
+            );
           }
+          setTeamMembers(membersToShow);
+          return;
         }
 
-        // Read currently applied project filters (set by Dashboard)
-        let projectIds: number[] = [];
-        const rawProjectIds = localStorage.getItem('selectedProjectIds');
-        if (rawProjectIds) {
-          try {
-            const parsedIds = JSON.parse(rawProjectIds);
-            if (Array.isArray(parsedIds)) {
-              projectIds = parsedIds.filter((id) => typeof id === 'number');
-            }
-          } catch (e) {
-            console.error('Failed to parse selectedProjectIds from localStorage:', e);
+        // When project filters are applied, fetch non-members for those projects
+        try {
+          const query = encodeURIComponent(selectedProjectIds.join(','));
+          const res = await fetch(`/api/projects/non-members?projectIds=${query}`);
+
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            console.error('Failed to fetch non-member team members:', data);
+            // Fall back to base members in case of error
+            setTeamMembers(baseMembers);
+            return;
           }
-        }
 
-        let membersToShow: any[] = baseMembers;
+          const data = await res.json();
+          const apiMembers: Array<{ id?: number }> = Array.isArray(data.members)
+            ? data.members
+            : [];
 
-        // If there are project filters, fetch members not involved in those projects
-        if (projectIds.length > 0) {
-          try {
-            const query = encodeURIComponent(projectIds.join(','));
-            const res = await fetch(`/api/projects/non-members?projectIds=${query}`);
-            const data = await res.json();
-
-            if (!res.ok) {
-              console.error('Failed to fetch non-member team members:', data);
-            } else if (Array.isArray(data.members)) {
-              const baseById = new Map<number, any>();
-              baseMembers.forEach((m: any) => {
-                if (m && typeof m.id === 'number') {
-                  baseById.set(m.id, m);
-                }
-              });
-
-              // Only show members that exist in cache (have capacity data from localStorage)
-              membersToShow = data.members
-                .map((m: any) => baseById.get(m.id))
-                .filter((m: any) => m !== undefined);
+          // Map API members to Redux members so we reuse capacity values
+          const baseById = new Map<number, TeamMemberWithCapacity>();
+          baseMembers.forEach((m) => {
+            if (m && typeof m.id === 'number') {
+              baseById.set(m.id, m);
             }
-          } catch (err) {
-            console.error('Error fetching non-member team members:', err);
-            setError('Failed to load filtered team members');
+          });
+
+          const nonMembersWithCapacity = apiMembers
+            .map((m) =>
+              typeof m?.id === 'number' ? baseById.get(m.id) : undefined
+            )
+            .filter((m): m is TeamMemberWithCapacity => m !== undefined);
+
+          let membersToShow = nonMembersWithCapacity;
+
+          // Hide members already placed into the project grid
+          if (projectTeamMemberIds && projectTeamMemberIds.length > 0) {
+            membersToShow = membersToShow.filter(
+              (m) => typeof m?.id === 'number' && !projectTeamMemberIds.includes(m.id)
+            );
           }
-        }
 
-        // Finally, hide any members that are currently in the Project Team grid
-        if (hiddenIds.length > 0) {
-          membersToShow = membersToShow.filter(
-            (m: any) => typeof m?.id === 'number' && !hiddenIds.includes(m.id)
-          );
+          setTeamMembers(membersToShow);
+        } catch (err) {
+          console.error('Error fetching non-member team members:', err);
+          // Fall back to base members if fetch fails
+          let membersToShow = baseMembers;
+          if (projectTeamMemberIds && projectTeamMemberIds.length > 0) {
+            membersToShow = membersToShow.filter(
+              (m) => typeof m?.id === 'number' && !projectTeamMemberIds.includes(m.id)
+            );
+          }
+          setTeamMembers(membersToShow);
         }
-
-        setTeamMembers(membersToShow as any);
       } catch (err: any) {
         console.error('Error loading team members for sidebar:', err);
         setError(err.message || 'Failed to load team members');
@@ -92,23 +103,8 @@ export default function Sidebar() {
       }
     };
 
-    // Initial load
     void loadMembers();
-
-    // Listen for updates from Dashboard (data or filters changed)
-    const handleUpdate = () => {
-      void loadMembers();
-    };
-
-    window.addEventListener('teamMembersUpdated', handleUpdate);
-    window.addEventListener('projectFilterChanged', handleUpdate);
-    window.addEventListener('sidebarMembersChanged', handleUpdate);
-    return () => {
-      window.removeEventListener('teamMembersUpdated', handleUpdate);
-      window.removeEventListener('projectFilterChanged', handleUpdate);
-      window.removeEventListener('sidebarMembersChanged', handleUpdate);
-    };
-  }, []);
+  }, [teamMembersRedux, selectedProjectIds, projectTeamMemberIds]);
 
   const renderContent = () => {
     if (loading) {
@@ -148,7 +144,7 @@ export default function Sidebar() {
     return (
       <ul className="space-y-3">
         {teamMembers.map((member: any) => {
-          // Read capacity values directly from localStorage (set by Dashboard)
+          // Read capacity values directly from Redux store (set by Dashboard)
           const percentage = typeof member.assignedCapacityPercentage === 'number' ? member.assignedCapacityPercentage : 0;
           const hours = typeof member.assignedCapacityHours === 'number' ? member.assignedCapacityHours : 0;
           const usedPercentage = typeof member.assignedCapacityUsedPercentage === 'number' ? member.assignedCapacityUsedPercentage : 0;
@@ -170,7 +166,6 @@ export default function Sidebar() {
                 e.dataTransfer.setData('memberId', String(member.id));
                 e.dataTransfer.effectAllowed = 'move';
 
-                // Prevent the whole sidebar text from appearing as the drag preview
                 try {
                   const helper = document.createElement('div');
                   helper.style.width = '1px';
@@ -264,28 +259,45 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="w-72 bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 border-r border-zinc-800 h-full overflow-y-auto shadow-2xl pb-12">
+    <aside className={`${isCollapsed ? 'w-16' : 'w-72'} bg-gradient-to-b from-zinc-950 via-zinc-900 to-zinc-950 border-r border-zinc-800 h-full overflow-y-auto shadow-2xl pb-12 transition-all duration-300 relative`}>
       <div className="p-5 space-y-5">
         {/* Sidebar header */}
-        <div className="flex items-center justify-between mb-1">
-          <div className="flex items-center gap-3">
-            <div className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 via-indigo-500 to-purple-500 shadow-lg">
+        <div className="relative mb-1">
+          <div className={`flex items-center gap-3 ${isCollapsed ? 'justify-center' : ''}`}>
+            <div className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 via-indigo-500 to-purple-500 shadow-lg flex-shrink-0">
               <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
             </div>
-            <div>
-              <h2 className="text-sm font-semibold text-zinc-100 tracking-wide uppercase">
-                Team Capacity
-              </h2>
-              <p className="text-xs text-zinc-400">
-                {teamMembers.length} member{teamMembers.length !== 1 ? 's' : ''} tracked
-              </p>
-            </div>
+            {!isCollapsed && (
+              <div className="flex-1 min-w-0">
+                <h2 className="text-sm font-semibold text-zinc-100 tracking-wide uppercase">
+                  Team Capacity
+                </h2>
+                <p className="text-xs text-zinc-400">
+                  {teamMembers.length} member{teamMembers.length !== 1 ? 's' : ''} tracked
+                </p>
+              </div>
+            )}
           </div>
+          {/* Collapse button - positioned absolutely to not affect layout */}
+          <button
+            onClick={() => setIsCollapsed(!isCollapsed)}
+            className="absolute top-0 right-0 flex-shrink-0 p-1.5 rounded-lg hover:bg-zinc-800/80 text-zinc-400 hover:text-zinc-100 transition-colors backdrop-blur-sm"
+            aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <svg
+              className={`w-4 h-4 transition-transform duration-300 ${isCollapsed ? '' : 'rotate-180'}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
         </div>
 
-        {renderContent()}
+        {!isCollapsed && renderContent()}
       </div>
     </aside>
   );

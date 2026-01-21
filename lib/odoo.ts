@@ -1,3 +1,4 @@
+
 interface OdooConfig {
   url: string;
   database: string;
@@ -557,7 +558,6 @@ class OdooClient {
     try {
       let uid: number;
 
-      // If user ID is provided in config, use it directly (skip authentication)
       if (this.config.userId) {
         uid = this.config.userId;
         this.uid = uid;
@@ -1053,12 +1053,6 @@ class OdooClient {
         return [];
       }
 
-      // New implementation: single search_read call using "employee_id in [...]"
-      // Domain (from your example):
-      // [
-      //   ["employee_id", "in", [29, 24]],
-      //   ["state", "=", "validate"]
-      // ]
       const domain: any[] = [
         ['employee_id', 'in', employeeIds],
         ['state', '=', 'validate'],
@@ -1110,6 +1104,210 @@ class OdooClient {
       throw error;
     }
   }
+  async getCurrentTaskStatus(taskIds: number[]): Promise<any[]> {
+    try {
+      if (!taskIds || taskIds.length === 0) {
+        return [];
+      }
+
+      let uid: number;
+
+      if (this.config.userId) {
+        uid = this.config.userId;
+        this.uid = uid;
+      } else {
+        uid = await this.authenticate();
+      }
+
+      const result = await this.jsonRpcCall('call', {
+        service: 'object',
+        method: 'execute_kw',
+        args: [
+          this.config.database,
+          uid,
+          this.config.apiKey,
+          'project.task',
+          'search_read',
+          [
+            [
+              ['id', 'in', taskIds]
+            ]
+          ],
+          {
+            fields: [
+              'id',
+              'name',
+              'user_ids',
+              'allocated_hours',
+              'effective_hours',
+              'stage_id',
+              'date_deadline',
+              'project_id'
+            ]
+          }
+        ]
+      });
+
+      return result || [];
+    } catch (error) {
+      console.error('Error fetching current task status from Odoo:', error);
+      throw error;
+    }
+  }
+
+  async getCurrentProjectStatus(projectIds: number[]): Promise<any[]> {
+    try {
+      if (!projectIds || projectIds.length === 0) {
+        return [];
+      }
+
+      let uid: number;
+
+      if (this.config.userId) {
+        uid = this.config.userId;
+        this.uid = uid;
+      } else {
+        uid = await this.authenticate();
+      }
+
+      const result = await this.jsonRpcCall('call', {
+        service: 'object',
+        method: 'execute_kw',
+        args: [
+          this.config.database,
+          uid,
+          this.config.apiKey,
+          'project.project',
+          'search_read',
+          [
+            [
+              ['id', 'in', projectIds]
+            ]
+          ],
+          {
+            fields: ['id', 'name', 'user_id', 'active']
+          }
+        ]
+      });
+
+      return result || [];
+    } catch (error) {
+      console.error('Error fetching current project status from Odoo:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Check the current Odoo status for given actions
+   * @param actions Array of actions to check (should be filtered by sessionId on the caller side)
+   * @returns Promise with current and planned states
+   */
+  async checkOdooStatus(actions: any[]): Promise<{
+    isReady: boolean;
+    taskStatuses: Array<{
+      original: any; // Current state from Odoo
+      upcoming: any; // Planned state from action
+      action: any;
+    }>;
+    projectStatuses: Array<{
+      original: any; // Current state from Odoo
+      upcoming: any; // Planned state from action
+      action: any;
+    }>;
+  }> {
+    try {
+      const result = {
+        isReady: false,
+        taskStatuses: [] as Array<{ original: any; upcoming: any; action: any; additional_info?: any }>,
+        projectStatuses: [] as Array<{ original: any; upcoming: any; action: any; additional_info?: any }>,
+      };
+
+      if (!actions || actions.length === 0) {
+        console.log('No actions provided to check');
+        return result;
+      }
+
+      // Group actions by action_type
+      const assignActions = actions.filter(action => action.action_type === 'assign');
+      const addToTeamActions = actions.filter(action => action.action_type === 'add_to_team');
+
+      // Process assign actions (tasks)
+      if (assignActions.length > 0) {
+        const taskIds = assignActions
+          .filter(action => action.entity_type === 'project.task')
+          .map(action => action.entity_id);
+        
+        if (taskIds.length > 0) {
+          const currentTaskStatuses = await this.getCurrentTaskStatus(taskIds);
+          
+          if (!currentTaskStatuses || currentTaskStatuses.length === 0) {
+            console.error('Tasks not found in Odoo:', taskIds);
+            return result;
+          }
+
+          // Match each action with its corresponding Odoo task
+          for (const action of assignActions.filter(a => a.entity_type === 'project.task')) {
+            const original = currentTaskStatuses.find((task: any) => task.id === action.entity_id);
+            if (original) {
+              result.taskStatuses.push({
+                original,
+                upcoming: action.after_state || {},
+                action,
+                additional_info: action.additional_info_json || {},
+              });
+            }
+          }
+        }
+      }
+
+      // Process add_to_team actions (projects)
+      if (addToTeamActions.length > 0) {
+        // Extract and flatten project IDs from condition_json
+        const projectIds: number[] = [];
+        addToTeamActions
+          .filter(action => action.entity_type === 'project.project' && action.condition_json?.project_ids)
+          .forEach(action => {
+            const ids = action.condition_json.project_ids;
+            if (Array.isArray(ids)) {
+              projectIds.push(...ids);
+            }
+          });
+        
+        // Remove duplicates
+        const uniqueProjectIds = [...new Set(projectIds)];
+        
+        if (uniqueProjectIds.length > 0) {
+          const currentProjectStatuses = await this.getCurrentProjectStatus(uniqueProjectIds);
+          
+          // Match each action with its corresponding Odoo project
+          for (const action of addToTeamActions.filter(a => a.entity_type === 'project.project')) {
+            const projectIdsInAction = action.condition_json?.project_ids || [];
+            for (const projectId of projectIdsInAction) {
+              const original = currentProjectStatuses.find((project: any) => project.id === projectId);
+              if (original) {
+                result.projectStatuses.push({
+                  original,
+                  upcoming: action.after_state || {},
+                  additional_info: action.additional_info_json || {},
+                  action,
+                });
+              }
+            }
+          }
+        }
+      }
+    
+      result.isReady = true;
+      return result;
+    } catch (error) {
+      console.error('Error checking Odoo status:', error);
+      return {
+        isReady: false,
+        taskStatuses: [],
+        projectStatuses: [],
+      };
+    }
+  }
 }
 
 export function createOdooClient(): OdooClient {
@@ -1126,4 +1324,26 @@ export function createOdooClient(): OdooClient {
   }
 
   return new OdooClient(config);
+}
+
+/**
+ * Check the current Odoo status (convenience function that creates client internally)
+ * @param actions Array of actions to check
+ * @returns Promise with current and planned states
+ */
+export async function checkOdooStatus(actions: any[]): Promise<{
+  isReady: boolean;
+  taskStatuses: Array<{
+    original: any;
+    upcoming: any;
+    action: any;
+  }>;
+  projectStatuses: Array<{
+    original: any;
+    upcoming: any;
+    action: any;
+  }>;
+}> {
+  const odooClient = createOdooClient();
+  return await odooClient.checkOdooStatus(actions);
 }
