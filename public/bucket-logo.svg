@@ -1,0 +1,43 @@
+<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Bucket -->
+  <path d="M 12 18 Q 12 14 16 14 L 24 14 Q 28 14 28 18 L 28 28 Q 28 30 26 30 L 14 30 Q 12 30 12 28 Z" 
+        fill="#00D9FF" 
+        filter="url(#glow)" 
+        opacity="0.9"/>
+  <!-- Bucket Handle -->
+  <path d="M 16 14 Q 16 10 20 10 Q 24 10 24 14" 
+        stroke="#00D9FF" 
+        stroke-width="2" 
+        fill="none" 
+        filter="url(#glow)" 
+        opacity="0.9"/>
+  <!-- Liquid Surface in Bucket -->
+  <path d="M 14 18 Q 20 20 26 18" 
+        stroke="#00D9FF" 
+        stroke-width="1.5" 
+        fill="none" 
+        filter="url(#glow)" 
+        opacity="0.8"/>
+  <!-- Pouring Liquid Stream -->
+  <path d="M 28 18 Q 30 20 32 24 Q 34 28 32 32" 
+        stroke="#00D9FF" 
+        stroke-width="3" 
+        fill="none" 
+        stroke-linecap="round" 
+        filter="url(#glow)" 
+        opacity="0.9"/>
+  <!-- Liquid Drop at End -->
+  <ellipse cx="32" cy="32" rx="2" ry="3" 
+           fill="#00D9FF" 
+           filter="url(#glow)" 
+           opacity="0.9"/>
+</svg>

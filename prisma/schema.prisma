@@ -1,0 +1,52 @@
+// This is your Prisma schema file,
+// learn more about the Prisma schema at https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ActionStatus {
+  CONFIRMED
+  DRAFT
+  FAILED
+}
+
+enum EntityType {
+  PROJECT_TASK @map("project.task")
+}
+
+model ActionSession {
+  id         String   @id @default(uuid())
+  created_by String
+  status     ActionStatus @default(DRAFT)
+  created_at DateTime @default(now())
+  actions    Action[]
+
+  @@index([created_at])
+  @@index([status])
+  @@map("action_sessions")
+}
+
+model Action {
+  id          String        @id @default(uuid())
+  session_id  String
+  description String
+  entity_type EntityType  @default(PROJECT_TASK)
+  entity_id   Int           // Odoo task ID
+  action_type String        // 'assign' | 'unassign' | 'change_stage'
+  before_state Json         // JSON object
+  after_state Json          // JSON object
+  applied_at  DateTime?
+  status      String        // 'pending' | 'applied' | 'failed'
+  session     ActionSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+
+  @@index([session_id])
+  @@index([entity_id, action_type])
+  @@index([status])
+  @@map("actions")
+}
