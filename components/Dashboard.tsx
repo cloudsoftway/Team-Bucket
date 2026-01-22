@@ -53,7 +53,6 @@ export default function Dashboard() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [isUnassignedSectionExpanded, setIsUnassignedSectionExpanded] = useState(true);
 
-  // Calculate member capacity based on weekly hours minus weekly vacation hours
   const getMemberCapacity = (member: TeamMember): { hours: number; percentage: number } => {
     const averageWeeklyHours = parseInt(localStorage.getItem('averageWeeklyHours') || '40', 10);
     const weeklyVacationHours = (member as any).weeklyVacationHours || 0;
@@ -94,12 +93,9 @@ export default function Dashboard() {
     return effort;
   };
 
-  // Calculate assigned capacity for a member (base capacity + assigned task efforts + open tasks)
   const getAssignedCapacity = (member: TeamMember): { hours: number; percentage: number; usedPercentage: number } => {
-    // Get base capacity (weekly hours - vacation hours)
     const baseCapacity = getMemberCapacity(member);
     
-    // Calculate assigned task effort in hours (from drag-and-drop)
     let totalEffort = 0;
     taskAssignments.forEach((assignedUserId, taskId) => {
       if (assignedUserId === member.id) {
@@ -630,7 +626,6 @@ export default function Dashboard() {
           };
         });
 
-        // Store team members with capacity in Redux
         dispatch(setTeamMembersRedux(membersWithCapacity));
       } catch (err) {
         console.error('Failed to cache team members:', err);

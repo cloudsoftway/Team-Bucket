@@ -13,6 +13,7 @@ export default function ActionsPanel() {
   const [reviewProjectStatuses, setReviewProjectStatuses] = useState<Array<{original: any; upcoming: any; action: any; additional_info?: any}>>([]);
   const [tasksExpanded, setTasksExpanded] = useState(true);
   const [teamMembersExpanded, setTeamMembersExpanded] = useState(true);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     loadActions();
@@ -121,6 +122,7 @@ export default function ActionsPanel() {
       if (taskStatuses.length > 0 || projectStatuses.length > 0) {
         setReviewTaskStatuses(taskStatuses);
         setReviewProjectStatuses(projectStatuses);
+        setCurrentSessionId(sessionId); // Store session ID for apply changes
       }
     } catch (error: any) {
       console.error('Error during reflex update:', error);
@@ -196,6 +198,7 @@ export default function ActionsPanel() {
                 onClick={() => {
                   setReviewTaskStatuses([]);
                   setReviewProjectStatuses([]);
+                  setCurrentSessionId(null);
                 }}
                 className="text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
                 aria-label="Close"
@@ -419,15 +422,63 @@ export default function ActionsPanel() {
                   onClick={() => {
                     setReviewTaskStatuses([]);
                     setReviewProjectStatuses([]);
+                    setCurrentSessionId(null);
                   }}
                   className="px-4 py-2 text-sm font-medium rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={() => {
-                    // TODO: call apply changes endpoint
-                    alert('Apply Changes not implemented yet');
+                  onClick={async () => {
+                    if (!currentSessionId) {
+                      alert('No session available. Please check Odoo status first.');
+                      return;
+                    }
+
+                    if (reviewTaskStatuses.length === 0 && reviewProjectStatuses.length === 0) {
+                      alert('No changes to apply.');
+                      return;
+                    }
+
+                    try {
+                      // Build status result from the review statuses
+                      const statusResult = {
+                        isReady: true,
+                        taskStatuses: reviewTaskStatuses,
+                        projectStatuses: reviewProjectStatuses,
+                      };
+
+                      const response = await fetch('/api/actions/apply-changes', {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                          sessionId: currentSessionId,
+                          statusResult: statusResult,
+                        }),
+                      });
+
+                      const data = await response.json();
+
+                      if (!response.ok || !data.success) {
+                        throw new Error(data?.error || 'Failed to apply changes');
+                      }
+
+                      // Show success message with details
+                      const message = `Changes applied successfully!\n\nTotal: ${data.total}\nSuccessful: ${data.successful}\nFailed: ${data.failed}`;
+                      alert(message);
+
+                      // Clear review statuses and close modal
+                      setReviewTaskStatuses([]);
+                      setReviewProjectStatuses([]);
+                      setCurrentSessionId(null);
+                      
+                      // Optionally: trigger a refresh of the actions list
+                      loadActions();
+                    } catch (err: any) {
+                      alert('Failed to apply changes: ' + (err.message || 'Unknown error'));
+                    }
                   }}
                   className="px-4 py-2 text-sm font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white shadow-md hover:shadow-lg"
                 >

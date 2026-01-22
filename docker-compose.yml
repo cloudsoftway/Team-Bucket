@@ -1,6 +1,15 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:latest
+    container_name: capacity-planning-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_team_bucket_data:/data
+
   postgres:
     image: postgres:16-alpine
     container_name: capacity-planning-db
@@ -21,3 +30,4 @@ services:
 
 volumes:
   postgres_team_bucket_data:
+  redis_team_bucket_data:

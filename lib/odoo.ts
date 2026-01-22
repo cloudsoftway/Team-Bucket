@@ -70,6 +70,31 @@ interface JsonRpcRequest {
   id: number;
 }
 
+/**
+ * Exact JSON-RPC payload for execute_kw write (stored in Redis, executed by worker).
+ * Format:
+ * {
+ *   "jsonrpc": "2.0",
+ *   "method": "call",
+ *   "params": {
+ *     "service": "object",
+ *     "method": "execute_kw",
+ *     "args": [ database, uid, apiKey, model, "write", [ [ids], { "user_ids": [[4, id], ...] } ] ]
+ *   },
+ *   "id": number
+ * }
+ */
+export interface OdooWriteRpcPayload {
+  jsonrpc: '2.0';
+  method: 'call';
+  params: {
+    service: 'object';
+    method: 'execute_kw';
+    args: [string, number, string, string, 'write', [number[], Record<string, any>]];
+  };
+  id: number;
+}
+
 interface JsonRpcResponse {
   jsonrpc: string;
   result?: any;
@@ -1198,10 +1223,322 @@ class OdooClient {
   }
 
   /**
-   * Check the current Odoo status for given actions
-   * @param actions Array of actions to check (should be filtered by sessionId on the caller side)
-   * @returns Promise with current and planned states
    */
+  generateAddMemberToTeamRpcCalls(projectStatuses: Array<{
+    original: any;
+    upcoming: any;
+    action: any;
+    additional_info?: any;
+  }>): Array<{
+    model: string;
+    method: string;
+    ids: number[];
+    values: Record<string, any>;
+    actionId: string;
+  }> {
+    const rpcCalls: Array<{
+      model: string;
+      method: string;
+      ids: number[];
+      values: Record<string, any>;
+      actionId: string;
+    }> = [];
+
+    // Group by project ID to merge user_ids for the same project
+    const projectUserMap = new Map<number, {
+      userIds: [number, number][];
+      actionIds: string[];
+    }>();
+
+    for (const status of projectStatuses) {
+      try {
+        const action = status.action;
+        const projectIds = action.condition_json?.project_ids;
+        const userIds = action.update_json?.user_ids;
+
+        if (!projectIds || !Array.isArray(projectIds) || projectIds.length === 0) {
+          console.warn(`Invalid add_to_team action ${action.id}: missing projectIds`);
+          continue;
+        }
+
+        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+          console.warn(`Invalid add_to_team action ${action.id}: missing userIds`);
+          continue;
+        }
+
+        // Normalize to Odoo format: [[4, userId], ...] (4 = link existing record)
+        const extractedUserIds: [number, number][] = [];
+        for (const userIdEntry of userIds) {
+          if (Array.isArray(userIdEntry) && userIdEntry.length >= 2 && userIdEntry[0] === 4) {
+            extractedUserIds.push([4, userIdEntry[1]]);
+          } else if (typeof userIdEntry === 'number') {
+            extractedUserIds.push([4, userIdEntry]);
+          }
+        }
+
+        if (extractedUserIds.length === 0) {
+          console.warn(`Invalid add_to_team action ${action.id}: no valid user IDs found`);
+          continue;
+        }
+
+        for (const projectId of projectIds) {
+          if (!projectUserMap.has(projectId)) {
+            projectUserMap.set(projectId, { userIds: [], actionIds: [] });
+          }
+          const projectData = projectUserMap.get(projectId)!;
+          for (const userIdTuple of extractedUserIds) {
+            const userId = userIdTuple[1];
+            if (!projectData.userIds.some((t) => t[1] === userId)) {
+              projectData.userIds.push(userIdTuple);
+            }
+          }
+          projectData.actionIds.push(action.id);
+        }
+      } catch (error: any) {
+        console.error(`Error processing project status for action ${status.action?.id}:`, error);
+      }
+    }
+
+    // Build RPC payloads: write(project.project, [id], { user_ids: [[4, id], ...] })
+    for (const [projectId, projectData] of projectUserMap.entries()) {
+      if (projectData.userIds.length === 0) continue;
+
+      const primaryActionId = projectData.actionIds[0];
+
+      // Structure matches: execute_kw(..., "write", [ [ids], { user_ids } ])
+      rpcCalls.push({
+        model: 'project.project',
+        method: 'write',
+        ids: [projectId], // [283] → args[5] = [ [283], { user_ids } ]
+        values: {
+          user_ids: projectData.userIds, // [[4, 31], ...] as in Odoo JSON-RPC
+        },
+        actionId: primaryActionId,
+      });
+    }
+
+    return rpcCalls;
+  }
+
+  /**
+   * Generate RPC calls for assigning tasks to members.
+   * Output format matches Odoo JSON-RPC execute_kw write:
+   * {
+   *   "jsonrpc": "2.0",
+   *   "method": "call",
+   *   "params": {
+   *     "service": "object",
+   *     "method": "execute_kw",
+   *     "args": [ "cloudsoftway", 31, "API_KEY", "project.task", "write", [ [1689], { "user_ids": [[6, 0, [31]]], "date_deadline": "2026-02-05", "allocated_hours": 8, "stage_id": 89 } ] ]
+   *   },
+   *   "id": 1
+   * }
+   * Note: user_ids uses Odoo replace format [[6, 0, [ids]]] to replace all existing links.
+   * @param taskStatuses - Array of task status objects from checkOdooStatus
+   * @returns Array of RPC call objects ready to be executed
+   */
+  generateAssignTasksToMembersRpcCalls(taskStatuses: Array<{
+    original: any;
+    upcoming: any;
+    action: any;
+    additional_info?: any;
+  }>): Array<{
+    model: string;
+    method: string;
+    ids: number[];
+    values: Record<string, any>;
+    actionId: string;
+  }> {
+    const rpcCalls: Array<{
+      model: string;
+      method: string;
+      ids: number[];
+      values: Record<string, any>;
+      actionId: string;
+    }> = [];
+
+    // Group by task ID to merge user_ids and other fields for the same task
+    const taskDataMap = new Map<number, {
+      userIds: number[]; 
+      actionIds: string[];
+      otherFields: Record<string, any>; // date_deadline, allocated_hours, stage_id, etc.
+    }>();
+
+    for (const status of taskStatuses) {
+      try {
+        const action = status.action;
+        const taskId = action.condition_json?.id;
+        const updateJson = action.update_json || {};
+
+        if (!taskId) {
+          console.warn(`Invalid assign action ${action.id}: missing taskId`);
+          continue;
+        }
+
+        const userIds = updateJson.user_ids;
+        if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+          console.warn(`Invalid assign action ${action.id}: missing userIds`);
+          continue;
+        }
+
+        // Extract user IDs from various formats
+        const extractedUserIds: number[] = [];
+        for (const userIdEntry of userIds) {
+          if (typeof userIdEntry === 'number') {
+            extractedUserIds.push(userIdEntry);
+          } else if (Array.isArray(userIdEntry) && userIdEntry.length >= 2) {
+            extractedUserIds.push(userIdEntry[1]);
+          }
+        }
+
+        if (extractedUserIds.length === 0) {
+          console.warn(`Invalid assign action ${action.id}: no valid user IDs found`);
+          continue;
+        }
+
+        // Initialize task entry if it doesn't exist
+        if (!taskDataMap.has(taskId)) {
+          taskDataMap.set(taskId, {
+            userIds: [],
+            actionIds: [],
+            otherFields: {},
+          });
+        }
+
+        const taskData = taskDataMap.get(taskId)!;
+        
+        // Merge user IDs, avoiding duplicates
+        for (const userId of extractedUserIds) {
+          if (!taskData.userIds.includes(userId)) {
+            taskData.userIds.push(userId);
+          }
+        }
+        
+      
+        for (const [key, value] of Object.entries(updateJson)) {
+          if (key !== 'user_ids' && value !== undefined && value !== null) {
+            taskData.otherFields[key] = value;
+          }
+        }
+        
+        taskData.actionIds.push(action.id);
+      } catch (error: any) {
+        console.error(`Error processing task status for action ${status.action?.id}:`, error);
+      }
+    }
+
+    for (const [taskId, taskData] of taskDataMap.entries()) {
+      if (taskData.userIds.length > 0) {
+        const primaryActionId = taskData.actionIds[0];
+
+       
+        const userIdsReplaceFormat: [6, 0, number[]][] = [[6, 0, taskData.userIds]];
+
+        const values: Record<string, any> = {
+          user_ids: userIdsReplaceFormat,
+          ...taskData.otherFields,
+        };
+
+        rpcCalls.push({
+          model: 'project.task',
+          method: 'write',
+          ids: [taskId],
+          values,
+          actionId: primaryActionId,
+        });
+      }
+    }
+
+    return rpcCalls;
+  }
+
+  
+  async applyActions(statusResult: {
+    isReady: boolean;
+    taskStatuses: Array<{
+      original: any;
+      upcoming: any;
+      action: any;
+      additional_info?: any;
+    }>;
+    projectStatuses: Array<{
+      original: any;
+      upcoming: any;
+      action: any;
+      additional_info?: any;
+    }>;
+  }): Promise<{
+    success: boolean;
+    total: number;
+    successful: number;
+    failed: number;
+    results: Array<{ actionId: string; success: boolean; error?: string }>;
+    queued?: boolean;
+    message?: string;
+  }> {
+    try {
+      if (!statusResult.isReady) {
+        return {
+          success: false,
+          total: 0,
+          successful: 0,
+          failed: 0,
+          results: [],
+        };
+      }
+
+      const allRpcCalls: Array<{
+        model: string;
+        method: string;
+        ids: number[];
+        values: Record<string, any>;
+        actionId: string;
+      }> = [];
+
+      // Generate RPC calls for adding team members
+      if (statusResult.projectStatuses.length > 0) {
+        const addTeamMemberCalls = this.generateAddMemberToTeamRpcCalls(statusResult.projectStatuses);
+        console.log('Generated add team member RPC calls:', addTeamMemberCalls);
+        allRpcCalls.push(...addTeamMemberCalls);
+      }
+
+      // Generate RPC calls for task assignments
+      if (statusResult.taskStatuses.length > 0) {
+        const assignTaskCalls = this.generateAssignTasksToMembersRpcCalls(statusResult.taskStatuses);
+        console.log('Generated assign task RPC calls:', assignTaskCalls);
+        allRpcCalls.push(...assignTaskCalls);
+      }
+
+      // Build exact JSON-RPC payloads and enqueue for worker
+      if (allRpcCalls.length > 0) {
+        const { enqueueRpcCalls } = await import('./redis');
+        const items: Array<{ payload: import('./odoo').OdooWriteRpcPayload; actionId: string }> = [];
+        for (const c of allRpcCalls) {
+          const payload = await this.buildWriteRpcPayload(c.model, c.ids, c.values);
+          // Log full JSON so args[5] ([ids, values]) is visible; plain console.log shows it as [Array]
+          console.log('rpc built:', JSON.stringify(payload, null, 2));
+          items.push({ payload, actionId: c.actionId });
+        }
+        await enqueueRpcCalls(items);
+        console.log(`Enqueued ${items.length} RPC calls (exact JSON-RPC) to Redis queue`);
+      }
+
+      return {
+        success: true,
+        total: allRpcCalls.length,
+        successful: 0, // Will be updated by worker
+        failed: 0, // Will be updated by worker
+        results: [], // Results will be available via worker
+        queued: true,
+        message: `${allRpcCalls.length} RPC calls queued for asynchronous execution`,
+      };
+    } catch (error) {
+      console.error('Error applying actions:', error);
+      throw error;
+    }
+  }
+
+
   async checkOdooStatus(actions: any[]): Promise<{
     isReady: boolean;
     taskStatuses: Array<{
@@ -1307,6 +1644,81 @@ class OdooClient {
         projectStatuses: [],
       };
     }
+  }
+
+  
+  async write(model: string, ids: number[], values: Record<string, any>): Promise<boolean> {
+    try {
+      if (!ids || ids.length === 0) {
+        throw new Error('At least one record ID is required');
+      }
+
+      if (!values || Object.keys(values).length === 0) {
+        throw new Error('At least one field value is required');
+      }
+
+      let uid: number;
+
+      if (this.config.userId) {
+        uid = this.config.userId;
+        this.uid = uid;
+      } else {
+        uid = await this.authenticate();
+      }
+
+      const result = await this.jsonRpcCall('call', {
+        service: 'object',
+        method: 'execute_kw',
+        args: [
+          this.config.database,
+          uid,
+          this.config.apiKey,
+          model,
+          'write',
+          [ids, values], // [ids array, values object] - Odoo write format
+        ],
+      });
+
+      // Odoo write returns True on success
+      return result === true;
+    } catch (error) {
+      console.error(`Error writing to ${model}:`, error);
+      throw error;
+    }
+  }
+
+  async buildWriteRpcPayload(
+    model: string,
+    ids: number[],
+    values: Record<string, any>,
+    rpcId: number = this.requestId++
+  ): Promise<OdooWriteRpcPayload> {
+    if (!ids?.length || !values || Object.keys(values).length === 0) {
+      throw new Error('ids and values required');
+    }
+    let uid: number;
+    if (this.config.userId) {
+      uid = this.config.userId;
+      this.uid = uid;
+    } else {
+      uid = await this.authenticate();
+    }
+
+    const writePayload: [number[], Record<string, any>] = [ids, values];
+    const args: [string, number, string, string, 'write', [number[], Record<string, any>]] = [
+      this.config.database,
+      uid,
+      this.config.apiKey,
+      model,
+      'write',
+      writePayload,
+    ];
+    return {
+      jsonrpc: '2.0',
+      method: 'call',
+      params: { service: 'object', method: 'execute_kw', args },
+      id: rpcId,
+    };
   }
 }
 
